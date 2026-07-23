@@ -36,39 +36,50 @@ while IFS= read -r GOMOD; do
   GO_VER=$(grep '^go ' "$GOMOD" 2>/dev/null | awk '{print $2}')
   [[ -n "$GO_VER" ]] && GO_BEFORE+="$GOMOD:$GO_VER "
 done < <(find_gomods)
-# shellcheck disable=SC2046 # word splitting is intentional (multiple file args)
-K8S_BEFORE=$(grep -h 'k8s.io/client-go' $(find_gomods) 2>/dev/null | grep -oP 'v0\.\K[0-9]+' | sort -un | tr '\n' ' ')
+# Only check root go.mod for K8s version changes (submodule K8s deps don't affect shipped binaries)
+K8S_BEFORE=$(grep -h 'k8s.io/client-go' go.mod 2>/dev/null | grep -oP 'v0\.\K[0-9]+' | sort -un | tr '\n' ' ')
 
 # Update in all go.mod files that contain this package
 while IFS= read -r GOMOD; do
   MODDIR=$(dirname "$GOMOD")
   if grep -qF "$PACKAGE" "$GOMOD" 2>/dev/null; then
-    echo "Updating $PACKAGE in $GOMOD..."
-    go -C "$MODDIR" get "${PACKAGE}@v${VERSION}" && go -C "$MODDIR" mod tidy
+    INSTALLED=$(grep -F "$PACKAGE" "$GOMOD" | grep -oP 'v\K[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    if [[ -n "$INSTALLED" ]] && version_gte "$INSTALLED" "$VERSION"; then
+      echo "NOTE: $GOMOD already has $PACKAGE v$INSTALLED (>= v$VERSION)"
+    else
+      echo "Updating $PACKAGE in $GOMOD..."
+      go -C "$MODDIR" get "${PACKAGE}@v${VERSION}" && go -C "$MODDIR" mod tidy
+    fi
   fi
 done < <(find_gomods)
 
 clean_gomod
 
-# Check for breaking changes (Go or K8s minor version upgrade in any go.mod)
+# Check for breaking changes (Go or K8s minor version upgrade)
+# Go directive bumps are safe if the build image already satisfies them.
+# K8s minor version changes are genuinely breaking (different API versions).
+COMPILER_GO=$(echo "$SHIPYARD_GO_VERSION" | grep -oP '[0-9]+\.[0-9]+\.[0-9]+' || echo "")
 BREAKING=""
 while IFS= read -r GOMOD; do
   GO_AFTER=$(grep '^go ' "$GOMOD" 2>/dev/null | awk '{print $2}')
   [[ -z "$GO_AFTER" ]] && continue
-  # Find the before version for this go.mod
   for PAIR in $GO_BEFORE; do
     if [[ "${PAIR%%:*}" == "$GOMOD" ]]; then
       GO_WAS="${PAIR#*:}"
       if [[ "$(echo "$GO_WAS" | cut -d. -f1-2)" != "$(echo "$GO_AFTER" | cut -d. -f1-2)" ]]; then
-        BREAKING="${BREAKING:+$BREAKING; }$GOMOD: Go $GO_WAS -> $GO_AFTER"
+        if [[ -n "$COMPILER_GO" ]] && \
+           [[ "$(printf '%s\n' "$COMPILER_GO" "$GO_AFTER" | sort -V | tail -1)" == "$COMPILER_GO" ]]; then
+          echo "NOTE: $GOMOD Go $GO_WAS -> $GO_AFTER (safe: build image has Go $COMPILER_GO)"
+        else
+          BREAKING="${BREAKING:+$BREAKING; }$GOMOD: Go $GO_WAS -> $GO_AFTER"
+        fi
       fi
       break
     fi
   done
 done < <(find_gomods)
 
-# shellcheck disable=SC2046 # word splitting is intentional (multiple file args)
-K8S_AFTER=$(grep -h 'k8s.io/client-go' $(find_gomods) 2>/dev/null | grep -oP 'v0\.\K[0-9]+' | sort -un | tr '\n' ' ')
+K8S_AFTER=$(grep -h 'k8s.io/client-go' go.mod 2>/dev/null | grep -oP 'v0\.\K[0-9]+' | sort -un | tr '\n' ' ')
 if [[ -n "$K8S_BEFORE" ]] && [[ -n "$K8S_AFTER" ]] && [[ "$K8S_BEFORE" != "$K8S_AFTER" ]]; then
   BREAKING="${BREAKING:+$BREAKING; }K8s minor versions changed"
 fi
@@ -79,14 +90,17 @@ if [[ -n "$BREAKING" ]]; then
   exit 2
 fi
 
-# Verify fix: check that go.mod has the new version
+# Verify fix: check that go.mod has version >= the fix version
 STILL_VULNERABLE=false
 while IFS= read -r GOMOD; do
-  if grep -q "${PACKAGE}.*v${VERSION}" "$GOMOD" 2>/dev/null; then
-    : # Updated to new version, good
-  elif grep -qF "$PACKAGE" "$GOMOD" 2>/dev/null; then
-    echo "WARNING: $GOMOD still has old version of $PACKAGE"
-    STILL_VULNERABLE=true
+  if grep -qF "$PACKAGE" "$GOMOD" 2>/dev/null; then
+    INSTALLED=$(grep -F "$PACKAGE" "$GOMOD" | grep -oP 'v\K[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    if [[ -n "$INSTALLED" ]] && version_gte "$INSTALLED" "$VERSION"; then
+      : # Installed version >= fix version, good
+    else
+      echo "WARNING: $GOMOD has $PACKAGE at v${INSTALLED:-unknown} (need >= v$VERSION)"
+      STILL_VULNERABLE=true
+    fi
   fi
 done < <(find_gomods)
 
@@ -109,25 +123,38 @@ if [[ -n "$GENERATED_FILE" ]] && [[ -n "$DIFF_IGNORE_ARGS" ]]; then
   fi
 fi
 
-# Determine if tools-only change (all staged go files under tools/)
-TOOLS_ONLY=""
-if ! git diff --staged --name-only | grep -qE '^go\.(mod|sum)$' && \
-     git diff --staged --name-only | grep -qE '^tools/'; then
-  TOOLS_ONLY=" in /tools"
-fi
+# If nothing to commit, the CVE was already fixed by a prior package upgrade
+if ! git diff --staged --quiet 2>/dev/null; then
+  # Determine if tools-only change (all staged go files under tools/)
+  TOOLS_ONLY=""
+  if ! git diff --staged --name-only | grep -qE '^go\.(mod|sum)$' && \
+       git diff --staged --name-only | grep -qE '^tools/'; then
+    TOOLS_ONLY=" in /tools"
+  fi
 
-# Format commit message
-ABBREV=$(abbreviate_package "$PACKAGE")
-if [[ ${#CVE_IDS[@]} -eq 1 ]]; then
-  SUBJECT="Bump ${ABBREV} for ${CVE_IDS[0]}${TOOLS_ONLY}"
-  BODY="Full package: $PACKAGE"
+  # Format commit message
+  ABBREV=$(abbreviate_package "$PACKAGE")
+  if [[ ${#CVE_IDS[@]} -eq 1 ]]; then
+    SUBJECT="Bump ${ABBREV} for ${CVE_IDS[0]}${TOOLS_ONLY}"
+    BODY="Full package: $PACKAGE"
+  else
+    SUBJECT="Bump ${ABBREV} for CVEs${TOOLS_ONLY}"
+    FIXES_LINE="Fixes: $(printf '%s, ' "${CVE_IDS[@]}")"
+    FIXES_LINE="${FIXES_LINE%, }"
+    if [[ ${#FIXES_LINE} -gt 80 ]]; then
+      FIXES=$(printf '  %s\n' "${CVE_IDS[@]}")
+      BODY="Full package: $PACKAGE
+Fixes:
+$FIXES"
+    else
+      BODY="Full package: $PACKAGE
+$FIXES_LINE"
+    fi
+  fi
+
+  git commit -s -m "$(printf '%s\n\n%s' "$SUBJECT" "$BODY")"
 else
-  SUBJECT="Bump ${ABBREV} for CVEs${TOOLS_ONLY}"
-  FIXES=$(printf '%s, ' "${CVE_IDS[@]}")
-  BODY="Full package: $PACKAGE
-Fixes: ${FIXES%, }"
+  echo "NOTE: $PACKAGE already at v$VERSION (fixed by prior upgrade)"
 fi
-
-git commit -s -m "$(printf '%s\n\n%s' "$SUBJECT" "$BODY")"
 
 echo "FIXED: $PACKAGE v$VERSION for ${CVE_IDS[*]}"

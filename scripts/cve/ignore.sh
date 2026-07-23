@@ -1,6 +1,8 @@
 #!/bin/bash
 # Add CVE(s) to the .grype.yaml ignore list and commit.
-# Usage: ignore.sh STATE_FILE PACKAGE SEVERITY REASON CVE_ID [CVE_ID...]
+# Use --no-fix when ignoring because no fix is available; the entry will
+# auto-expire once grype's vulnerability DB shows a fix exists.
+# Usage: ignore.sh STATE_FILE PACKAGE SEVERITY REASON [--no-fix] CVE_ID [CVE_ID...]
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -8,11 +10,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib.sh
 source "$SCRIPT_DIR/lib.sh"
 
-STATE_FILE="${1:?Usage: ignore.sh STATE_FILE PACKAGE SEVERITY REASON CVE_ID [CVE_ID...]}"
+STATE_FILE="${1:?Usage: ignore.sh STATE_FILE PACKAGE SEVERITY REASON [--no-fix] CVE_ID [CVE_ID...]}"
 PACKAGE="${2:?Missing PACKAGE}"
 SEVERITY="${3:?Missing SEVERITY}"
 REASON="${4:?Missing REASON}"
 shift 4
+
+FIX_STATE=""
+if [[ "${1:-}" == "--no-fix" ]]; then
+  FIX_STATE="not-fixed"
+  shift
+fi
+
 CVE_IDS=("$@")
 [[ ${#CVE_IDS[@]} -gt 0 ]] || { echo "ERROR: At least one CVE_ID required" >&2; exit 1; }
 
@@ -21,7 +30,7 @@ load_state "$STATE_FILE"
 echo "--- Ignoring: ${CVE_IDS[*]} ($PACKAGE) [$SEVERITY] ---"
 
 for CVE_ID in "${CVE_IDS[@]}"; do
-  insert_grype_ignore .grype.yaml "$CVE_ID" "$PACKAGE" "$REASON"
+  insert_grype_ignore .grype.yaml "$CVE_ID" "$PACKAGE" "$REASON" "$FIX_STATE"
 done
 
 git add .grype.yaml

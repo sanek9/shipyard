@@ -87,6 +87,11 @@ run_grype() {
   return 1
 }
 
+# Check if version A >= version B (semver, uses sort -V)
+version_gte() {
+  [[ "$(printf '%s\n' "$1" "$2" | sort -V | head -1)" == "$2" ]]
+}
+
 # Abbreviate Go package path for commit messages
 # github.com/docker/docker -> docker/docker
 # golang.org/x/net -> x/net
@@ -131,12 +136,16 @@ clean_gomod() {
 
 # Insert an ignore entry into a .grype.yaml file.
 # Inserts before exclude: section if present, otherwise appends.
-# Usage: insert_grype_ignore FILE CVE_ID PACKAGE REASON
+# When FIX_STATE is provided (e.g. "not-fixed"), the entry auto-expires
+# once grype's DB shows a fix is available.
+# Usage: insert_grype_ignore FILE CVE_ID PACKAGE REASON [FIX_STATE]
 insert_grype_ignore() {
-  local file="$1" cve_id="$2" package="$3" reason="$4"
+  local file="$1" cve_id="$2" package="$3" reason="$4" fix_state="${5:-}"
   local entry
   entry="  # $reason
-  - vulnerability: $cve_id
+  - vulnerability: $cve_id"
+  [[ -n "$fix_state" ]] && entry+=$'\n'"    fix-state: $fix_state"
+  entry+="
     package:
       name: $package"
 

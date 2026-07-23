@@ -45,6 +45,10 @@ check "abbrev grpc" test "$(abbreviate_package google.golang.org/grpc)" = "grpc"
 check "abbrev sigs" test "$(abbreviate_package sigs.k8s.io/controller-runtime)" = "controller-runtime"
 CVE_LIST=("GHSA-aaaa" "GHSA-bbbb"); JOINED=$(printf '%s, ' "${CVE_LIST[@]}"); JOINED="${JOINED%, }"
 check "CVE join" test "$JOINED" = "GHSA-aaaa, GHSA-bbbb"
+check "gte higher" version_gte 0.45.0 0.44.0
+check "gte equal" version_gte 0.44.0 0.44.0
+check "gte lower" ! version_gte 0.41.0 0.44.0
+check "gte major" version_gte 28.0.0 0.44.0
 
 # === clean_gomod ===
 echo "clean_gomod"

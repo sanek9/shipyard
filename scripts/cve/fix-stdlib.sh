@@ -1,6 +1,6 @@
 #!/bin/bash
 # Fix stdlib CVEs by updating the go directive.
-# Usage: fix-stdlib.sh STATE_FILE GO_VERSION CVE_ID [CVE_ID...]
+# Usage: fix-stdlib.sh STATE_FILE GO_VERSION ALL_FIX_VERSIONS CVE_ID [CVE_ID...]
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -8,9 +8,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib.sh
 source "$SCRIPT_DIR/lib.sh"
 
-STATE_FILE="${1:?Usage: fix-stdlib.sh STATE_FILE GO_VERSION CVE_ID [CVE_ID...]}"
+STATE_FILE="${1:?Usage: fix-stdlib.sh STATE_FILE GO_VERSION ALL_FIX_VERSIONS CVE_ID [CVE_ID...]}"
 GO_VERSION="${2:?Missing GO_VERSION}"
-shift 2
+ALL_FIX_VERSIONS="${3:-}"
+shift 3
 CVE_IDS=("$@")
 [[ ${#CVE_IDS[@]} -gt 0 ]] || { echo "ERROR: At least one CVE_ID required" >&2; exit 1; }
 
@@ -22,12 +23,46 @@ echo "--- Fixing stdlib: go $GO_VERSION for ${CVE_IDS[*]} ---"
 
 OLD_GO=$(grep '^go ' go.mod | awk '{print $2}')
 
-# Check for Go minor version upgrade (breaking on stable branches)
-OLD_MINOR=$(echo "$OLD_GO" | cut -d. -f1-2)
+# Use build image compiler version if known, else fall back to go.mod
+COMPILER_GO=$(echo "$SHIPYARD_GO_VERSION" | grep -oP '[0-9]+\.[0-9]+\.[0-9]+' || echo "")
+REF_GO="${COMPILER_GO:-$OLD_GO}"
+REF_MINOR=$(echo "$REF_GO" | cut -d. -f1-2)
+
+# Pick fix version matching the compiler's minor stream
+if [[ -n "$COMPILER_GO" ]] && [[ -n "$ALL_FIX_VERSIONS" ]]; then
+  IFS=',' read -ra FIX_VERS <<< "$ALL_FIX_VERSIONS"
+  for v in "${FIX_VERS[@]}"; do
+    if [[ "$(echo "$v" | cut -d. -f1-2)" == "$REF_MINOR" ]]; then
+      GO_VERSION="$v"
+      break
+    fi
+  done
+fi
+
 NEW_MINOR=$(echo "$GO_VERSION" | cut -d. -f1-2)
-if [[ "$OLD_MINOR" != "$NEW_MINOR" ]]; then
-  echo "NEEDS_REVIEW: stdlib — would upgrade Go $OLD_GO -> $GO_VERSION (minor version change)"
+
+# Check if fix is in the compiler's minor stream
+if [[ "$REF_MINOR" != "$NEW_MINOR" ]]; then
+  if [[ -n "$COMPILER_GO" ]]; then
+    echo "NEEDS_REVIEW: stdlib — no fix in compiler stream $REF_MINOR (build image Go $COMPILER_GO, fix needs $GO_VERSION)"
+  else
+    echo "NEEDS_REVIEW: stdlib — would upgrade Go $OLD_GO -> $GO_VERSION (minor version change)"
+  fi
   exit 2
+fi
+
+# Patch bump in the right stream — but can the build image support it?
+if [[ -n "$COMPILER_GO" ]]; then
+  if [[ "$(printf '%s\n' "$COMPILER_GO" "$GO_VERSION" | sort -V | head -1)" == "$COMPILER_GO" ]] && \
+     [[ "$COMPILER_GO" != "$GO_VERSION" ]]; then
+    echo "NEEDS_REVIEW: stdlib — build image has Go $COMPILER_GO, fix needs $GO_VERSION (patch bump, rebuild shipyard-dapper-base)"
+    exit 2
+  fi
+fi
+
+# Compiler already has the fix version — bump go.mod to match
+if [[ -z "${GOTOOLCHAIN:-}" ]]; then
+  export GOTOOLCHAIN=auto
 fi
 
 # Check host Go version is sufficient

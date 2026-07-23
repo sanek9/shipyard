@@ -84,14 +84,22 @@ CONTAINER_CMD=$(detect_container_cmd)
 HAS_LOCAL_GRYPE=false
 command -v grype &>/dev/null && HAS_LOCAL_GRYPE=true
 
-# Shipyard build image
-if [[ "$BRANCH" == "devel" ]]; then
-  SHIPYARD_TAG="devel"
-elif [[ "$BRANCH" =~ ^release- ]]; then
-  SHIPYARD_TAG="$BRANCH"
-else
-  echo "WARNING: Unknown branch pattern, assuming devel build image"
-  SHIPYARD_TAG="devel"
+# Shipyard build image — read BASE_BRANCH from the repo's Makefile (which
+# flows into SHIPYARD_TAG via Makefile.dapper), fall back to branch inference.
+SHIPYARD_TAG=""
+if [[ -f Makefile ]]; then
+  SHIPYARD_TAG=$(grep -oP '^\s*BASE_BRANCH\s*\?=\s*\K\S+' Makefile || echo "")
+fi
+
+if [[ -z "$SHIPYARD_TAG" ]]; then
+  if [[ "$BRANCH" == "devel" ]]; then
+    SHIPYARD_TAG="devel"
+  elif [[ "$BRANCH" =~ ^release- ]]; then
+    SHIPYARD_TAG="$BRANCH"
+  else
+    echo "WARNING: Unknown branch pattern, assuming devel build image"
+    SHIPYARD_TAG="devel"
+  fi
 fi
 
 SHIPYARD_IMAGE="quay.io/submariner/shipyard-dapper-base:${SHIPYARD_TAG}"
@@ -104,11 +112,21 @@ fi
 ORIGINAL_REF=""
 FIX_BRANCH=""
 FETCH_FAILED=false
+WORKTREE_DIR=""
+
+# Detect self-referential fix (fixing the repo that contains these scripts).
+# Checkout would overwrite the scripts on disk, so use a worktree instead.
+SCRIPT_REPO=$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null || echo "")
+SELF_FIX=false
+[[ "$SCRIPT_REPO" == "$REPO" ]] && SELF_FIX=true
 
 if [[ "$SETUP_BRANCH" == "true" ]]; then
-  if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null; then
-    echo "ERROR: Working tree has uncommitted changes. Commit or stash first." >&2
-    exit 1
+  # Uncommitted changes check: skip for self-fix (worktree won't touch working tree)
+  if [[ "$SELF_FIX" != "true" ]]; then
+    if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null; then
+      echo "ERROR: Working tree has uncommitted changes. Commit or stash first." >&2
+      exit 1
+    fi
   fi
 
   ORIGINAL_REF=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
@@ -130,11 +148,33 @@ if [[ "$SETUP_BRANCH" == "true" ]]; then
   done
   FIX_BRANCH="${FIX_BRANCH}${SUFFIX}"
 
-  if ! git checkout -b "$FIX_BRANCH" "origin/$BRANCH" 2>/dev/null; then
-    echo "ERROR: Could not create fix branch from origin/$BRANCH" >&2
-    exit 1
+  if [[ "$SELF_FIX" == "true" ]]; then
+    WORKTREE_DIR=$(mktemp -d)
+    if ! git worktree add -b "$FIX_BRANCH" "$WORKTREE_DIR" "origin/$BRANCH" 2>/dev/null; then
+      rm -rf "$WORKTREE_DIR"
+      echo "ERROR: Could not create worktree from origin/$BRANCH" >&2
+      exit 1
+    fi
+    REPO="$WORKTREE_DIR"
+    # Re-detect build image from target branch Makefile
+    if [[ -f "$WORKTREE_DIR/Makefile" ]]; then
+      _TAG=$(grep -oP '^\s*BASE_BRANCH\s*\?=\s*\K\S+' "$WORKTREE_DIR/Makefile" || echo "")
+      if [[ -n "$_TAG" ]]; then
+        SHIPYARD_TAG="$_TAG"
+        SHIPYARD_IMAGE="quay.io/submariner/shipyard-dapper-base:${SHIPYARD_TAG}"
+        if [[ -n "$CONTAINER_CMD" ]] && [[ -n "$($CONTAINER_CMD image ls -q "$SHIPYARD_IMAGE" 2>/dev/null)" ]]; then
+          SHIPYARD_GO_VERSION=$($CONTAINER_CMD run --rm "$SHIPYARD_IMAGE" go version 2>/dev/null || echo "unknown")
+        fi
+      fi
+    fi
+    echo "Fix branch: $FIX_BRANCH (worktree: $WORKTREE_DIR)"
+  else
+    if ! git checkout -b "$FIX_BRANCH" "origin/$BRANCH" 2>/dev/null; then
+      echo "ERROR: Could not create fix branch from origin/$BRANCH" >&2
+      exit 1
+    fi
+    echo "Fix branch: $FIX_BRANCH"
   fi
-  echo "Fix branch: $FIX_BRANCH"
 fi
 
 # --- Write state file ---
@@ -154,6 +194,7 @@ HAS_LOCAL_GRYPE=$HAS_LOCAL_GRYPE
 SHIPYARD_IMAGE="$SHIPYARD_IMAGE"
 SHIPYARD_GO_VERSION="$SHIPYARD_GO_VERSION"
 FETCH_FAILED=$FETCH_FAILED
+WORKTREE_DIR="$WORKTREE_DIR"
 CVE_SCRIPTS="$SCRIPT_DIR"
 EOF
 

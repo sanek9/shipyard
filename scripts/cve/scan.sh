@@ -24,8 +24,11 @@ for arg in "$@"; do
 done
 
 # Build if needed (e.g., submariner repo with UPX compression for stdlib CVE detection)
+# Unset SHIPYARD_TAG so the repo's own BASE_BRANCH controls which build image is used.
+# Without this, shipyard's exported SHIPYARD_TAG=devel leaks into the child make and
+# overrides the repo's ?= assignment, causing builds with the wrong Go version.
 if [[ "$NEEDS_BUILD_FOR_SCAN" == "true" ]] && [[ "$SKIP_BUILD" != "true" ]]; then
-  if ! make BUILD_UPX=false build >&2; then
+  if ! env -u SHIPYARD_TAG make BUILD_UPX=false build >&2; then
     echo "WARNING: Build failed. Scanning source only (may miss stdlib CVEs in binaries)." >&2
     echo "VPN can cause transient Docker DNS failures. Retry, or: sudo systemctl restart docker" >&2
   fi

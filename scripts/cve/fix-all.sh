@@ -54,8 +54,14 @@ fi
 if [[ "$MATCH_COUNT" -eq 0 ]]; then
   echo "No CVEs found. $(basename "$REPO")/$BRANCH is clean."
   if [[ -n "$FIX_BRANCH" ]]; then
-    git checkout "$ORIGINAL_REF" 2>/dev/null
-    git branch -D "$FIX_BRANCH" 2>/dev/null
+    if [[ -n "$WORKTREE_DIR" ]]; then
+      cd / 2>/dev/null || true
+      git -C "$SCRIPT_DIR" worktree remove --force "$WORKTREE_DIR" 2>/dev/null || true
+      git -C "$SCRIPT_DIR" branch -D "$FIX_BRANCH" 2>/dev/null || true
+    else
+      git checkout "$ORIGINAL_REF" 2>/dev/null
+      git branch -D "$FIX_BRANCH" 2>/dev/null
+    fi
   fi
   exit 0
 fi
@@ -79,6 +85,7 @@ CVE_LINES=$(printf '%s\n' "$SCAN_JSON" | jq -r '
     {
       pkg: .artifact.name,
       fixedIn: .vulnerability.fix.versions[0],
+      allFixVersions: (.vulnerability.fix.versions | join(",")),
       cve: .vulnerability.id,
       severity: .vulnerability.severity,
       type: (if .artifact.name == "stdlib" then "stdlib" else "package" end)
@@ -89,11 +96,12 @@ CVE_LINES=$(printf '%s\n' "$SCAN_JSON" | jq -r '
     pkg: .[0].pkg,
     type: .[0].type,
     fixedIn: (map(.fixedIn) | sort_by(split(".") | map(tonumber)) | last),
+    allFixVersions: (if .[0].type == "stdlib" then ([.[].allFixVersions] | unique | join(",")) else "" end),
     cves: (map(.cve) | unique),
     severity: .[0].severity
   }) |
   .[] |
-  "\(.type)\t\(.pkg)\t\(.fixedIn)\t\(.cves | join(","))\t\(.severity)"
+  "\(.type)\t\(.pkg)\t\(.fixedIn)\t\(.cves | join(","))\t\(.severity)\t\(.allFixVersions)"
 ' 2>/dev/null || echo "")
 
 if [[ -z "$CVE_LINES" ]]; then
@@ -107,7 +115,7 @@ FIX_SUMMARY=""
 FIXED_COUNT=0
 REVIEW_COUNT=0
 
-while IFS=$'\t' read -r TYPE PKG FIX_VER CVE_CSV _SEVERITY; do
+while IFS=$'\t' read -r TYPE PKG FIX_VER CVE_CSV _SEVERITY ALL_FIX_VERS; do
   [[ -z "$PKG" ]] && continue
 
   # Split CVE_CSV into array
@@ -116,12 +124,13 @@ while IFS=$'\t' read -r TYPE PKG FIX_VER CVE_CSV _SEVERITY; do
   FIX_LOG=$(mktemp)
   if [[ "$TYPE" == "stdlib" ]]; then
     STDLIB_EXIT=0
-    "$SCRIPT_DIR/fix-stdlib.sh" "$STATE_FILE" "$FIX_VER" "${CVES[@]}" 2>&1 | tee "$FIX_LOG" || STDLIB_EXIT=$?
+    "$SCRIPT_DIR/fix-stdlib.sh" "$STATE_FILE" "$FIX_VER" "$ALL_FIX_VERS" "${CVES[@]}" 2>&1 | tee "$FIX_LOG" || STDLIB_EXIT=$?
     if [[ "$STDLIB_EXIT" -eq 0 ]]; then
       FIX_SUMMARY+="FIXED: stdlib go $FIX_VER for ${CVES[*]}"$'\n'
       FIXED_COUNT=$((FIXED_COUNT + 1))
     else
-      FIX_SUMMARY+="NEEDS_REVIEW: stdlib — fix-stdlib.sh exited $STDLIB_EXIT"$'\n'
+      REASON=$(grep "^NEEDS_REVIEW:" "$FIX_LOG" || echo "NEEDS_REVIEW: stdlib — fix-stdlib.sh exited $STDLIB_EXIT")
+      FIX_SUMMARY+="$REASON"$'\n'
       REVIEW_COUNT=$((REVIEW_COUNT + 1))
     fi
   else
@@ -149,7 +158,7 @@ done <<< "$CVE_LINES"
 # Verify
 echo ""
 echo "Running unit tests..."
-if ! make unit; then
+if ! env -u SHIPYARD_TAG make unit; then
   FIX_SUMMARY+="NEEDS_REVIEW: unit tests failed after applying fixes"$'\n'
   REVIEW_COUNT=$((REVIEW_COUNT + 1))
 fi
@@ -185,6 +194,9 @@ if [[ "$COMMIT_COUNT" -gt 0 ]]; then
   FORK_USER=$(git remote get-url "${FORK_REMOTE}" 2>/dev/null | sed -E 's#.*github.com[:/]+([^/]+)/.*#\1#')
 
   echo "PR command:"
+  if [[ -n "${WORKTREE_DIR:-}" ]]; then
+    echo "cd $WORKTREE_DIR && \\"
+  fi
   echo "git push $FORK_REMOTE $CURRENT_BRANCH && \\"
   echo "gh pr create \\"
   echo "  --title \"Fix CVE${PLURAL} in ${BASE_BRANCH}\" \\"

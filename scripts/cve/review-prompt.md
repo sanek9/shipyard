@@ -28,10 +28,16 @@ Review ALL CVE outcomes:
 
 2. **Handle unfixed CVEs**: For each CVE that was not fixed:
    - Try a different approach if possible (different version, drop replace directive)
-   - If fix would break the branch: add to .grype.yaml ignore list.
-     **Batch all CVEs for the same package into one ignore.sh call** (it accepts multiple CVE IDs).
+   - If **no fix is available**: use `--no-fix` so the entry auto-expires when a fix is published.
+     Run: `bash ${CVE_SCRIPTS}/ignore.sh ${STATE_FILE} PACKAGE SEVERITY "reason" --no-fix CVE_ID [CVE_ID...]`
+   - If fix requires a **Go or K8s minor version upgrade** on a stable branch: report as **UNRESOLVED**.
+     Do NOT ignore — this needs team approval.
+     **Exception**: Go directive bumps that are already committed were validated by the deterministic phase
+     against the build image (Go ${SHIPYARD_GO_VERSION}). Do NOT roll back or flag these.
+   - If fix exists but would break API compatibility (not a version upgrade): omit `--no-fix` (permanent ignore).
      Run: `bash ${CVE_SCRIPTS}/ignore.sh ${STATE_FILE} PACKAGE SEVERITY "reason" CVE_ID [CVE_ID...]`
-   - Note anything that needs team discussion
+   - **One ignore.sh call per package.** Combine ALL CVEs regardless of severity.
+     Use the highest severity for the SEVERITY arg (it is only a log label).
 
 3. **Check for regressions**: Did any fix introduce new CVEs?
 
@@ -41,11 +47,12 @@ ONLY use these scripts. Do NOT run go/git/sed commands directly.
 
 - `bash ${CVE_SCRIPTS}/fix-package.sh ${STATE_FILE} PACKAGE VERSION CVE_IDS...`
 - `bash ${CVE_SCRIPTS}/fix-stdlib.sh ${STATE_FILE} GO_VERSION CVE_IDS...`
-- `bash ${CVE_SCRIPTS}/ignore.sh ${STATE_FILE} PACKAGE SEVERITY "reason" CVE_ID [CVE_ID...]`
+- `bash ${CVE_SCRIPTS}/ignore.sh ${STATE_FILE} PACKAGE SEVERITY "reason" [--no-fix] CVE_ID [CVE_ID...]`
 - `bash ${CVE_SCRIPTS}/scan.sh ${STATE_FILE}`
 
 If a script exits with NEEDS_REVIEW, do NOT attempt the same fix manually.
-Use ignore.sh to document it, or report it as UNRESOLVED.
+If the reason indicates a policy decision (version upgrade), report as UNRESOLVED.
+Otherwise use ignore.sh.
 
 ## Output
 
